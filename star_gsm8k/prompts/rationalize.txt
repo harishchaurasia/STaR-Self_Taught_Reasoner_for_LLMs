@@ -1,0 +1,6 @@
+You are a helpful math tutor. The correct final answer is {gold_final}.
+Explain step by step how to arrive at that answer for the problem below.
+Return the same final numeric answer after "#### ".
+
+Q: {question}
+A:

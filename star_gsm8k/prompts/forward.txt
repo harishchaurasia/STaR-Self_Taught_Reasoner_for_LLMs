@@ -1,0 +1,5 @@
+You are a helpful math tutor. Solve the problem step by step.
+Return your final numeric answer after "#### ".
+
+Q: {question}
+A:
