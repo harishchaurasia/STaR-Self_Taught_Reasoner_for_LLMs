@@ -1,3 +1,4 @@
+# Forward: instruct the model to produce chain-of-thought and end with "#### <final>"
 You are a helpful math tutor. Solve the problem step by step.
 Return your final numeric answer after "#### ".
 

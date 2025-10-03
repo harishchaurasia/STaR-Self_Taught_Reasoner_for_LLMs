@@ -1,4 +1,6 @@
 # src/sft_train_wrapper.py
+# Sanity-check SFT input and call the class SFT trainer script.
+# WARNING: adjust the "cmd" list to your class script's exact flags if they differ.
 import argparse, subprocess, sys
 from src.utils import read_jsonl
 
@@ -14,26 +16,27 @@ def main():
     ap.add_argument("--grad_accum", type=int, default=2)
     args = ap.parse_args()
 
-    # quick sanity check
-    n = 0
+    # sanity-check
+    n=0
     for r in read_jsonl(args.train):
-        t = r.get("text", "")
+        t=r.get("text","")
         assert "###Input:" in t and "###Output:" in t and "#### " in t, "Bad training line format"
-        n += 1
+        n+=1
     print(f"[sft_wrapper] training file OK with {n} lines")
 
-    # TODO: replace the example below with the exact class script command and flags you used in class.
-    # Example placeholder:
+    # TODO: adapt this command if your class trainer expects different flags.
+    # This example assumes your class script is cse_576_inference_and_training.py and uses flags:
+    # --train_file, --output_dir, --pretrained, --num_epochs, --learning_rate, --max_seq_len, --batch_size, --grad_accum
     cmd = [
-        "python", "class_sft_train.py",
-        "--base_model", args.base_model,
-        "--train_file", args.train,
-        "--save_dir", args.save_dir,
-        "--epochs", str(args.epochs),
-        "--lr", str(args.lr),
-        "--seq_len", str(args.seq_len),
-        "--per_device_batch", str(args.per_device_batch),
-        "--grad_accum", str(args.grad_accum),
+      "python", "cse_576_inference_and_training.py",
+      "--train_file", args.train,
+      "--output_dir", args.save_dir,
+      "--pretrained", args.base_model,
+      "--num_epochs", str(args.epochs),
+      "--learning_rate", str(args.lr),
+      "--max_seq_len", str(args.seq_len),
+      "--batch_size", str(args.per_device_batch),
+      "--grad_accum", str(args.grad_accum),
     ]
     print("[sft_wrapper] running:", " ".join(cmd))
     rc = subprocess.call(cmd)

@@ -1,4 +1,5 @@
 # src/star_build.py
+# Merge forward-kept and rationalized-kept into class-format SFT JSONL
 import argparse
 from src.utils import read_jsonl, write_jsonl
 
@@ -9,12 +10,12 @@ def main():
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    keep = {}
+    keep={}
     for path in [args.forward, args.rationalized]:
         for r in read_jsonl(path):
             keep[r["id"]] = r
 
-    rows = []
+    rows=[]
     for r in keep.values():
         text = f"###Input:\n{r['question']}\n\n###Output:\n{r['rationale']}\n#### {r['final']}"
         rows.append({"id": r["id"], "text": text})
