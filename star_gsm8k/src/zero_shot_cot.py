@@ -8,45 +8,9 @@ import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # Prompt template for Zero-shot CoT
-PROMPT_TMPL = "Q: {q}\nLet's think step by step.\nA:"
-
-# simple function to extract the last numeric answer from generated text
-# def extract_final_answer(text):
-
-#     if text is None:
-#         return ""
-#     # common patterns:
-#     # patterns = [
-#     #     r"answer(?: is|:)?\s*([-\d,\.]+)\b",
-#     #     r"final answer(?: is|:)?\s*([-\d,\.]+)\b",
-#     #     r"=\s*([-\d,\.]+)\b",
-#     #     r"=>\s*([-\d,\.]+)\b",
-#     # ]
-#     patterns = [
-#         r"final answer(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
-#         r"answer(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
-#         r"=\s*([+-]?\d+\.?\d*)\b",
-#         r"=>\s*([+-]?\d+\.?\d*)\b",
-#         r"####\s*([+-]?\d+\.?\d*)\b",   # handle "#### 3" style
-#         r"result(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
-#     ]
-#     lower = text.lower()
-#     for p in patterns:
-#         m = re.search(p, lower)
-#         if m:
-#             s = m.group(1)
-#             s = s.replace(',', '')
-#             return s.strip()
-#     # fallback: find last integer/float token
-#     nums = re.findall(r"[-]?\d+\.?\d*", text.replace(',', ''))
-#     if nums:
-#         return nums[-1]
-#     # nothing numeric found: return last non-empty line as answer (trim)
-#     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-#     return lines[-1] if lines else ""
+DEFAULT_PROMPT_TMPL = "Q: {q}\nLet's think step by step.\nA:"
 
 def extract_final_answer(text):
-    """Robust numeric extractor from generated text or gold strings."""
     if text is None:
         return ""
     txt = str(text).strip()
@@ -54,46 +18,31 @@ def extract_final_answer(text):
     patterns = [
         r"final answer(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
         r"answer(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
-        r"=\s*([+-]?\d+\.?\d*)\b",
-        r"=>\s*([+-]?\d+\.?\d*)\b",
         r"####\s*([+-]?\d+\.?\d*)\b",
+        r"=>\s*([+-]?\d+\.?\d*)\b",
+        r"=\s*([+-]?\d+\.?\d*)\b",
         r"result(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
     ]
     for p in patterns:
-        m = re.search(p, lower)
-        if m:
-            return m.group(1).replace(',', '')
-    # fallback: last numeric token
-    nums = re.findall(r"[+-]?\d+\.?\d*", txt.replace(',', ''))
-    if nums:
-        return nums[-1]
-    # fallback: last non-empty line
-    lines = [l.strip() for l in txt.splitlines() if l.strip()]
-    if lines:
-        return lines[-1]
-    return ""
-
+        matches = re.findall(p, lower)
+        if matches:
+            return matches[-1].replace(",", "")
+    nums = re.findall(r"[+-]?\d+\.?\d*", txt.replace(",", ""))
+    return nums[-1] if nums else (txt.splitlines()[-1].strip() if txt.splitlines() else "")
 
 def normalize_answer_for_em(ans):
-    """Normalize extracted answer to an integer string if possible, else strip whitespace/lower."""
     if ans is None:
         return ""
-    s = str(ans).strip()
-    # strip trailing periods
-    s = s.rstrip('.')
-    # try int
+    s = str(ans).strip().rstrip(".")
     try:
-        # handle floats that are integral like "5.0"
-        f = float(s)
-        i = int(round(f))
-        return str(i)
+        f = float(s.replace(",", ""))
+        if f.is_integer():
+            return str(int(f))
+        return s.lower()
     except Exception:
-        pass
-    # fallback normalize whitespace/case
-    return s.lower()
+        return s.lower()
 
 def exact_match(gold, pred):
-    # gold and pred are strings; try numeric match first
     if gold is None:
         return 0
     g = normalize_answer_for_em(gold)
@@ -102,9 +51,10 @@ def exact_match(gold, pred):
 
 def load_test_lines(path):
     lines = []
-    with open(path, 'r', encoding='utf-8') as f:
+    with open(path, "r", encoding="utf-8") as f:
         for ln in f:
-            if not ln.strip(): continue
+            if not ln.strip():
+                continue
             j = json.loads(ln)
             lines.append(j)
     return lines
@@ -117,21 +67,29 @@ def main():
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--device", default="auto", help="'cuda' or 'cpu' or 'auto'")
+    ap.add_argument("--prompt_template", default=None, help="Override default prompt template (use {q} for question)")
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
+
+    # Resolve prompt template without scoping issues
+    prompt_tmpl = args.prompt_template or DEFAULT_PROMPT_TMPL
 
     torch.manual_seed(args.seed)
 
     # load tokenizer + model
     print("Loading tokenizer and model from", args.model, file=sys.stderr)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_auth_token=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, token=True)
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
+    model = AutoModelForCausalLM.from_pretrained(
+        args.model, device_map="auto", torch_dtype="auto", token=True
+    )
 
-    model = AutoModelForCausalLM.from_pretrained(args.model, device_map="auto", torch_dtype="auto")
     device = next(model.parameters()).device
     print("Model parameters on", device, file=sys.stderr)
+
+    print("Model loaded", file=sys.stderr)
 
     test_lines = load_test_lines(args.test)
     print(f"Loaded {len(test_lines)} test examples", file=sys.stderr)
@@ -145,62 +103,63 @@ def main():
     for ex in pbar:
         qid = ex.get("id", None)
         question = ex.get("question", ex.get("Q", ex.get("q", "")))
-        prompt = PROMPT_TMPL.format(q=question)
-        inputs = tokenizer(prompt, return_tensors="pt").to(device)
+        prompt = prompt_tmpl.format(q=question)
 
-        # generate
-        gen = model.generate(
+        # Encode on CPU; device_map='auto' will handle execution placement
+        # inputs = tokenizer(prompt, return_tensors="pt")
+        inputs = tokenizer(prompt, return_tensors="pt")
+        # move all input tensors to the model device (handles cpu/cuda/multi-device)
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+
+
+        # Deterministic greedy decoding; temperature is ignored when do_sample=False
+        gen_ids = model.generate(
             **inputs,
             max_new_tokens=args.max_new_tokens,
-            do_sample=False,  # greedy deterministic for EM evaluation
+            do_sample=False,
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
-            output_scores=False,
-            return_dict_in_generate=False,
         )
-        text = tokenizer.decode(gen[0], skip_special_tokens=True)
 
-        # ASSUME the model echoes the prompt; find the generated part after the prompt
-        if text.startswith(prompt):
-            generated = text[len(prompt):].strip()
-        else:
-            # fallback
-            generated = text.strip()
+        # Slice continuation by input length to exclude the prompt
+        input_ids = inputs["input_ids"]
+        cont_ids = gen_ids[:, input_ids.shape[1]:]
+        generated = tokenizer.batch_decode(cont_ids, skip_special_tokens=True)[0].strip()
 
-        # try to split rationale vs final answer: naive heuristic:
-        # - rationale = all but last line; final = last line or numeric extraction
+        # Split rationale vs final line and extract numeric
         lines = [l.strip() for l in generated.splitlines() if l.strip()]
         rationale = "\n".join(lines[:-1]) if len(lines) > 1 else generated
         final_answer = extract_final_answer(generated)
 
-        # gold answer: try fields (raw) then extract numeric answer for EM comparison
-        gold_raw = ex.get("answer") or ex.get("gold_answer") or ex.get("final_answer") or ex.get("answer_text") or ex.get("A") or ""
+        gold_raw = (
+            ex.get("answer")
+            or ex.get("gold_answer")
+            or ex.get("final_answer")
+            or ex.get("answer_text")
+            or ex.get("A")
+            or ""
+        )
         gold_extracted = extract_final_answer(gold_raw)
-        # compare extracted gold numeric vs predicted extracted final_answer
         em = exact_match(gold_extracted, final_answer) if gold_extracted != "" else None
         if em is not None:
             total_em += em
 
-        # keep a copy of the raw gold field for output
-        gold = gold_raw
         outj = {
             "id": qid,
             "question": question,
             "generated": generated,
             "rationale": rationale,
             "answer": final_answer,
-            "gold": gold,
+            "gold": gold_raw,
             "gold_extracted": gold_extracted,
             "em": em,
         }
         results.append(outj)
 
-    # write results
     with open(out_path, "w", encoding="utf-8") as w:
         for r in results:
             w.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    # summary
     n_with_gold = sum(1 for r in results if r["em"] is not None)
     if n_with_gold:
         acc = total_em / n_with_gold
