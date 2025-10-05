@@ -11,31 +11,68 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 PROMPT_TMPL = "Q: {q}\nLet's think step by step.\nA:"
 
 # simple function to extract the last numeric answer from generated text
-def extract_final_answer(text):
+# def extract_final_answer(text):
 
+#     if text is None:
+#         return ""
+#     # common patterns:
+#     # patterns = [
+#     #     r"answer(?: is|:)?\s*([-\d,\.]+)\b",
+#     #     r"final answer(?: is|:)?\s*([-\d,\.]+)\b",
+#     #     r"=\s*([-\d,\.]+)\b",
+#     #     r"=>\s*([-\d,\.]+)\b",
+#     # ]
+#     patterns = [
+#         r"final answer(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
+#         r"answer(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
+#         r"=\s*([+-]?\d+\.?\d*)\b",
+#         r"=>\s*([+-]?\d+\.?\d*)\b",
+#         r"####\s*([+-]?\d+\.?\d*)\b",   # handle "#### 3" style
+#         r"result(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
+#     ]
+#     lower = text.lower()
+#     for p in patterns:
+#         m = re.search(p, lower)
+#         if m:
+#             s = m.group(1)
+#             s = s.replace(',', '')
+#             return s.strip()
+#     # fallback: find last integer/float token
+#     nums = re.findall(r"[-]?\d+\.?\d*", text.replace(',', ''))
+#     if nums:
+#         return nums[-1]
+#     # nothing numeric found: return last non-empty line as answer (trim)
+#     lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
+#     return lines[-1] if lines else ""
+
+def extract_final_answer(text):
+    """Robust numeric extractor from generated text or gold strings."""
     if text is None:
         return ""
-    # common patterns:
+    txt = str(text).strip()
+    lower = txt.lower()
     patterns = [
-        r"answer(?: is|:)?\s*([-\d,\.]+)\b",
-        r"final answer(?: is|:)?\s*([-\d,\.]+)\b",
-        r"=\s*([-\d,\.]+)\b",
-        r"=>\s*([-\d,\.]+)\b",
+        r"final answer(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
+        r"answer(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
+        r"=\s*([+-]?\d+\.?\d*)\b",
+        r"=>\s*([+-]?\d+\.?\d*)\b",
+        r"####\s*([+-]?\d+\.?\d*)\b",
+        r"result(?: is|:)?\s*([+-]?\d+\.?\d*)\b",
     ]
-    lower = text.lower()
     for p in patterns:
         m = re.search(p, lower)
         if m:
-            s = m.group(1)
-            s = s.replace(',', '')
-            return s.strip()
-    # fallback: find last integer/float token
-    nums = re.findall(r"[-]?\d+\.?\d*", text.replace(',', ''))
+            return m.group(1).replace(',', '')
+    # fallback: last numeric token
+    nums = re.findall(r"[+-]?\d+\.?\d*", txt.replace(',', ''))
     if nums:
         return nums[-1]
-    # nothing numeric found: return last non-empty line as answer (trim)
-    lines = [l.strip() for l in text.strip().splitlines() if l.strip()]
-    return lines[-1] if lines else ""
+    # fallback: last non-empty line
+    lines = [l.strip() for l in txt.splitlines() if l.strip()]
+    if lines:
+        return lines[-1]
+    return ""
+
 
 def normalize_answer_for_em(ans):
     """Normalize extracted answer to an integer string if possible, else strip whitespace/lower."""
@@ -115,8 +152,7 @@ def main():
         gen = model.generate(
             **inputs,
             max_new_tokens=args.max_new_tokens,
-            temperature=args.temperature,
-            do_sample=False,  # deterministic greedy by default for EM evaluation; set True for creative outputs
+            do_sample=False,  # greedy deterministic for EM evaluation
             pad_token_id=tokenizer.eos_token_id,
             eos_token_id=tokenizer.eos_token_id,
             output_scores=False,
@@ -137,13 +173,16 @@ def main():
         rationale = "\n".join(lines[:-1]) if len(lines) > 1 else generated
         final_answer = extract_final_answer(generated)
 
-        # gold answer: try fields gold_answer, answer, final_answer, or 'answer' inside ex
-        gold = ex.get("answer") or ex.get("gold_answer") or ex.get("final_answer") or ex.get("answer_text") or ex.get("A") or None
-
-        em = exact_match(gold, final_answer) if gold is not None else None
+        # gold answer: try fields (raw) then extract numeric answer for EM comparison
+        gold_raw = ex.get("answer") or ex.get("gold_answer") or ex.get("final_answer") or ex.get("answer_text") or ex.get("A") or ""
+        gold_extracted = extract_final_answer(gold_raw)
+        # compare extracted gold numeric vs predicted extracted final_answer
+        em = exact_match(gold_extracted, final_answer) if gold_extracted != "" else None
         if em is not None:
             total_em += em
 
+        # keep a copy of the raw gold field for output
+        gold = gold_raw
         outj = {
             "id": qid,
             "question": question,
@@ -151,6 +190,7 @@ def main():
             "rationale": rationale,
             "answer": final_answer,
             "gold": gold,
+            "gold_extracted": gold_extracted,
             "em": em,
         }
         results.append(outj)
