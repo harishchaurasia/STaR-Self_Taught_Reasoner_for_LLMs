@@ -78,13 +78,45 @@ def main():
     torch.manual_seed(args.seed)
 
     # load tokenizer + model
-    print("Loading tokenizer and model from", args.model, file=sys.stderr)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, token=True)
-    if getattr(tokenizer, "pad_token_id", None) is None:
-        tokenizer.pad_token_id = tokenizer.eos_token_id
+    # print("Loading tokenizer and model from", args.model, file=sys.stderr)
+    # tokenizer = AutoTokenizer.from_pretrained(args.model, token=True)
+    # if getattr(tokenizer, "pad_token_id", None) is None:
+    #     tokenizer.pad_token_id = tokenizer.eos_token_id
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     args.model, device_map="auto", torch_dtype="auto", token=True
+    # )
+
+    print("Loading tokenizer and model from", args.model)
+
+    # For local checkpoints, never pass token/use_auth_token
+    # tokenizer = AutoTokenizer.from_pretrained(args.model)
+    # if getattr(tokenizer, "pad_token_id", None) is None:
+    #     tokenizer.pad_token_id = tokenizer.eos_token_id
+
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     args.model,
+    #     device_map="auto",
+    #     torch_dtype="auto"
+    # )
+
+    # prefer remote tokenizer from the HF model id, fallback to local if needed
+    HF_MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
+
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID, use_fast=True)
+    except Exception:
+        # as fallback, try the local checkpoint but force slow tokenizer
+        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+
+    # load model from local checkpoint directory (args.model)
     model = AutoModelForCausalLM.from_pretrained(
-        args.model, device_map="auto", torch_dtype="auto", token=True
+        args.model,
+        device_map="auto",
+        dtype="auto"
     )
+
+
+
 
     device = next(model.parameters()).device
     print("Model parameters on", device, file=sys.stderr)

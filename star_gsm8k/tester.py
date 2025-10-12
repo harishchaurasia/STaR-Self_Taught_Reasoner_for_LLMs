@@ -29,13 +29,17 @@
 # from huggingface_hub import whoami
 # print("whoami ->", whoami())
 
-from datasets import load_dataset
-import json
-# load the GSM8K dataset's main split
-ds = load_dataset("openai/gsm8k", "main")["test"]   # if this line errors, try: load_dataset("openai/gsm8k","main")
-outpath = "data/gsm8k_test.jsonl"
-with open(outpath, "w", encoding="utf-8") as f:
-    for i, ex in enumerate(ds):
-        record = {"id": i, "question": ex["question"], "answer": ex["answer"]}
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
-print("✅ Wrote", len(ds), "examples to", outpath)
+# from datasets import load_dataset
+# import json
+# # load the GSM8K dataset's main split
+# ds = load_dataset("openai/gsm8k", "main")["test"]   # if this line errors, try: load_dataset("openai/gsm8k","main")
+# outpath = "data/gsm8k_test.jsonl"
+# with open(outpath, "w", encoding="utf-8") as f:
+#     for i, ex in enumerate(ds):
+#         record = {"id": i, "question": ex["question"], "answer": ex["answer"]}
+#         f.write(json.dumps(record, ensure_ascii=False) + "\n")
+# print("✅ Wrote", len(ds), "examples to", outpath)
+
+import os
+p = "./checkpoints/sft_test_run/epoch1"
+print("exists:", os.path.exists(p), "isdir:", os.path.isdir(p), "files:", os.listdir(p)[:20])
