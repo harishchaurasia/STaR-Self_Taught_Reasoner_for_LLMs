@@ -1,0 +1,10 @@
+/Users/harishchaurasia/Desktop/StaR Model Training and Inferencing/star_gsm8k/.venv
+star_gsm8k/.venv
+star_gsm8k/hf_models
+star_gsm8k/checkpoints
+star_gsm8k/data/gsm8k_train_sft.jsonl
+
+checkpoints/
+hf_models/
+
+*.jsonl
