@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 
-import argparse, json, re, sys, math, os
+import argparse, json, re, sys, os
 from pathlib import Path
 from tqdm import tqdm
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# Prompt template for Zero-shot CoT
-DEFAULT_PROMPT_TMPL = "Q: {q}\nLet's think step by step.\nA:"
+# System/env speedups
+os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+torch.backends.cuda.matmul.allow_tf32 = True
+
+# Prompt template for Zero-shot CoT with explicit final line
+DEFAULT_PROMPT_TMPL = (
+    "Q: {q}\n"
+    "Let's think step by step.\n"
+    "Please give the final answer as '#### <number>' on the last line.\n"
+    "A:"
+)
 
 def extract_final_answer(text):
     if text is None:
@@ -64,63 +73,72 @@ def main():
     ap.add_argument("--model", required=True, help="local model path or HF id")
     ap.add_argument("--test", required=True, help="input JSONL with questions (id + question fields)")
     ap.add_argument("--out", required=True, help="output JSONL predictions")
-    ap.add_argument("--max_new_tokens", type=int, default=256)
-    ap.add_argument("--temperature", type=float, default=0.2)
+    ap.add_argument("--max_new_tokens", type=int, default=512)
+    ap.add_argument("--temperature", type=float, default=0.0)
     ap.add_argument("--device", default="auto", help="'cuda' or 'cpu' or 'auto'")
     ap.add_argument("--prompt_template", default=None, help="Override default prompt template (use {q} for question)")
-    ap.add_argument("--batch", type=int, default=1)
+    ap.add_argument("--batch", type=int, default=16)
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--no_compile", action="store_true", help="disable torch.compile if set")
     args = ap.parse_args()
 
-    # Resolve prompt template without scoping issues
+    # Resolve prompt template
     prompt_tmpl = args.prompt_template or DEFAULT_PROMPT_TMPL
 
+    # Reproducibility
     torch.manual_seed(args.seed)
 
-    # load tokenizer + model
-    # print("Loading tokenizer and model from", args.model, file=sys.stderr)
-    # tokenizer = AutoTokenizer.from_pretrained(args.model, token=True)
-    # if getattr(tokenizer, "pad_token_id", None) is None:
-    #     tokenizer.pad_token_id = tokenizer.eos_token_id
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     args.model, device_map="auto", torch_dtype="auto", token=True
-    # )
+    print("Loading tokenizer and model from", args.model, file=sys.stderr)
 
-    print("Loading tokenizer and model from", args.model)
+    # Load tokenizer from the same source as model for alignment
+    tok_src = args.model
+    tokenizer = AutoTokenizer.from_pretrained(tok_src, use_fast=True)
+    if getattr(tokenizer, "pad_token_id", None) is None:
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+    tokenizer.padding_side = "left"
 
-    # For local checkpoints, never pass token/use_auth_token
-    # tokenizer = AutoTokenizer.from_pretrained(args.model)
-    # if getattr(tokenizer, "pad_token_id", None) is None:
-    #     tokenizer.pad_token_id = tokenizer.eos_token_id
-
-    # model = AutoModelForCausalLM.from_pretrained(
-    #     args.model,
-    #     device_map="auto",
-    #     torch_dtype="auto"
-    # )
-
-    # prefer remote tokenizer from the HF model id, fallback to local if needed
-    HF_MODEL_ID = "meta-llama/Llama-3.2-3B-Instruct"
-
+    attn_impl = "flash_attention_2"
     try:
-        tokenizer = AutoTokenizer.from_pretrained(HF_MODEL_ID, use_fast=True)
+        import flash_attn  # noqa: F401
     except Exception:
-        # as fallback, try the local checkpoint but force slow tokenizer
-        tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=False)
+        attn_impl = "sdpa" 
 
-    # load model from local checkpoint directory (args.model)
+    # Load model on A100 with bf16 + FlashAttention-2
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map="auto",
-        dtype="auto"
+        dtype=torch.bfloat16,
+        attn_implementation=attn_impl,
     )
 
+    # before compiling
+    try:
+        import torch._inductor.config as inductor_config
+        inductor_config.triton.cudagraphs = False
+    except Exception:
+        pass
+
+    if not args.no_compile:
+        try:
+            model.forward = torch.compile(
+                model.forward,
+                mode="reduce-overhead",
+                fullgraph=True,
+                options={"triton.cudagraphs": False},  # disable CUDA Graphs
+            )
+        except Exception:
+            pass
 
 
+    # Prefer static cache for repeated batched decoding
+    # try:
+    #     model.generation_config.cache_implementation = "static"
+    # except Exception:
+    #     pass
 
+    model.eval()
     device = next(model.parameters()).device
     print("Model parameters on", device, file=sys.stderr)
-
     print("Model loaded", file=sys.stderr)
 
     test_lines = load_test_lines(args.test)
@@ -131,68 +149,74 @@ def main():
 
     results = []
     total_em = 0
-    pbar = tqdm(test_lines, desc="ZeroShotCoT")
-    for ex in pbar:
-        qid = ex.get("id", None)
-        question = ex.get("question", ex.get("Q", ex.get("q", "")))
-        prompt = prompt_tmpl.format(q=question)
+    n_with_gold = 0
 
-        # Encode on CPU; device_map='auto' will handle execution placement
-        # inputs = tokenizer(prompt, return_tensors="pt")
-        inputs = tokenizer(prompt, return_tensors="pt")
-        # move all input tensors to the model device (handles cpu/cuda/multi-device)
-        inputs = {k: v.to(device) for k, v in inputs.items()}
+    # Batched generation loop
+    pbar = tqdm(range(0, len(test_lines), args.batch), desc="ZeroShotCoT")
+    with torch.no_grad():
+        for start in pbar:
+            chunk = test_lines[start:start + args.batch]
+            questions = [
+                ex.get("question", ex.get("Q", ex.get("q", ""))) for ex in chunk
+            ]
+            prompts = [prompt_tmpl.format(q=q) for q in questions]
 
+            inputs = tokenizer(
+                prompts,
+                return_tensors="pt",
+                padding=True,
+                pad_to_multiple_of=8,
+            )
+            inputs = {k: v.to(device) for k, v in inputs.items()}
 
-        # Deterministic greedy decoding; temperature is ignored when do_sample=False
-        gen_ids = model.generate(
-            **inputs,
-            max_new_tokens=args.max_new_tokens,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
-            eos_token_id=tokenizer.eos_token_id,
-        )
+            gen_ids = model.generate(
+                **inputs,
+                max_new_tokens=args.max_new_tokens,
+                do_sample=False,  # deterministic greedy decoding
+                use_cache=True,
+                pad_token_id=tokenizer.eos_token_id,
+                eos_token_id=tokenizer.eos_token_id,
+            )
 
-        # Slice continuation by input length to exclude the prompt
-        input_ids = inputs["input_ids"]
-        cont_ids = gen_ids[:, input_ids.shape[1]:]
-        generated = tokenizer.batch_decode(cont_ids, skip_special_tokens=True)[0].strip()
+            input_len = inputs["input_ids"].shape[1]
+            cont_ids = gen_ids[:, input_len:]
+            generations = tokenizer.batch_decode(cont_ids, skip_special_tokens=True)
 
-        # Split rationale vs final line and extract numeric
-        lines = [l.strip() for l in generated.splitlines() if l.strip()]
-        rationale = "\n".join(lines[:-1]) if len(lines) > 1 else generated
-        final_answer = extract_final_answer(generated)
+            for ex, generated in zip(chunk, generations):
+                generated = generated.strip()
+                lines = [l.strip() for l in generated.splitlines() if l.strip()]
+                rationale = "\n".join(lines[:-1]) if len(lines) > 1 else generated
+                final_answer = extract_final_answer(generated)
 
-        gold_raw = (
-            ex.get("answer")
-            or ex.get("gold_answer")
-            or ex.get("final_answer")
-            or ex.get("answer_text")
-            or ex.get("A")
-            or ""
-        )
-        gold_extracted = extract_final_answer(gold_raw)
-        em = exact_match(gold_extracted, final_answer) if gold_extracted != "" else None
-        if em is not None:
-            total_em += em
+                gold_raw = (
+                    ex.get("answer")
+                    or ex.get("gold_answer")
+                    or ex.get("final_answer")
+                    or ex.get("answer_text")
+                    or ex.get("A")
+                    or ""
+                )
+                gold_extracted = extract_final_answer(gold_raw)
+                em = exact_match(gold_extracted, final_answer) if gold_extracted != "" else None
+                if em is not None:
+                    total_em += em
+                    n_with_gold += 1
 
-        outj = {
-            "id": qid,
-            "question": question,
-            "generated": generated,
-            "rationale": rationale,
-            "answer": final_answer,
-            "gold": gold_raw,
-            "gold_extracted": gold_extracted,
-            "em": em,
-        }
-        results.append(outj)
+                results.append({
+                    "id": ex.get("id", None),
+                    "question": ex.get("question", ex.get("Q", ex.get("q", ""))),
+                    "generated": generated,
+                    "rationale": rationale,
+                    "answer": final_answer,
+                    "gold": gold_raw,
+                    "gold_extracted": gold_extracted,
+                    "em": em,
+                })
 
     with open(out_path, "w", encoding="utf-8") as w:
         for r in results:
             w.write(json.dumps(r, ensure_ascii=False) + "\n")
 
-    n_with_gold = sum(1 for r in results if r["em"] is not None)
     if n_with_gold:
         acc = total_em / n_with_gold
         print(f"Zero-shot EM on {n_with_gold} = {acc:.4%}", file=sys.stderr)

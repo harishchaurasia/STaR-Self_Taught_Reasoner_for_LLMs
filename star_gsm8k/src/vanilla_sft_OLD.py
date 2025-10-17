@@ -1,12 +1,23 @@
 #!/usr/bin/env python3
 """
-Vanilla SFT for GSM8K with bf16/FA2 options, stable formatting, and safer memory usage.
+Single-file Vanilla SFT launcher (GSM8K) - updated with robust training loop,
+proper AMP / GradScaler handling, and forward exception handling.
+
+Usage example (quick small run):
+  python3 src/vanilla_sft.py --subset 100 --epochs 1 --batch 1 --grad_accum 4 --lr 1e-5 --fp16 --out checkpoints/sft_test_run
+
+Be careful with full runs (large model + full GSM8K) — they require lots of GPU memory.
 """
 
-import argparse, json, os, math, random, time, re
+import argparse
+import json
+import os
+import math
+import random
+import time
 from datetime import datetime
 from pathlib import Path
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 
 import torch
 from torch import optim
@@ -15,23 +26,23 @@ from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 import datasets
 from transformers import AutoTokenizer, AutoModelForCausalLM
-from torch.cuda.amp import GradScaler  # NOTE: no autocast import; use torch.autocast
-
-# Optional A100 speedup for FP32 matmuls
-torch.set_float32_matmul_precision("high")  # TF32 on A100
-# Avoid tokenizer thread contention
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+from torch.cuda.amp import autocast, GradScaler
 
 # ---------------------
-# Helpers / profiling stubs
+# Minimal stubs / helpers (to avoid external dependencies)
 # ---------------------
 class MemoryTrace:
-    def __enter__(self): return self
-    def __exit__(self, exc_type, exc, tb): pass
-    def print_stats(self): pass
+    """Stub to mimic memory tracing context manager used by the original train()."""
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        pass
+    def print_stats(self):
+        pass
 
 @contextmanager
 def profile(train_config, local_rank=None):
+    """Stub profile context manager used in original code."""
     class P:
         def step(self): pass
         def is_done(self): return False
@@ -40,6 +51,7 @@ def profile(train_config, local_rank=None):
 
 def save_to_json(filename, train_step_loss, train_loss, train_step_perplexity, train_prep,
                  val_step_loss, val_loss, val_step_perplexity, val_prep):
+    """Save metrics in a compact JSON for plotting later (append/overwrite)."""
     try:
         out = {
             "train_step_loss": train_step_loss,
@@ -59,7 +71,7 @@ def save_to_json(filename, train_step_loss, train_loss, train_step_perplexity, t
         print("Warning: save_to_json failed:", e)
 
 # ---------------------
-# GSM8K SFT data prep
+# Data prep: create SFT JSONL from GSM8K train
 # ---------------------
 def prepare_gsm8k_sft(out_path="data/gsm8k_train_sft.jsonl"):
     os.makedirs(os.path.dirname(out_path) or ".", exist_ok=True)
@@ -70,17 +82,11 @@ def prepare_gsm8k_sft(out_path="data/gsm8k_train_sft.jsonl"):
     ds = datasets.load_dataset("gsm8k", "main")["train"]
     with open(out_path, "w", encoding="utf-8") as f:
         for i, ex in enumerate(ds):
-            q = (ex.get("question","") or "").strip()
-            solution = (ex.get("solution") or "").strip()
-            m = re.findall(r"####\s*([+-]?\d+\.?\d*)\b", solution)
-            num = m[-1] if m else ""
-            ans_field = (ex.get("answer","") or "").strip()
-            j = {
-                "id": i,
-                "question": q,
-                "rationale": solution,
-                "answer": f"#### {num}" if num else ans_field
-            }
+            q = ex.get("question","").strip()
+            # choose the best available rationale/solution field if present
+            rationale = ex.get("solution") or ex.get("explanation") or ex.get("answer", "")
+            ans = ex.get("answer", "").strip()
+            j = {"id": i, "question": q, "rationale": rationale, "answer": ans}
             f.write(json.dumps(j, ensure_ascii=False) + "\n")
     print(f"[prepare] Wrote {len(ds)} examples to {out_path}")
     return out_path
@@ -89,17 +95,21 @@ def prepare_gsm8k_sft(out_path="data/gsm8k_train_sft.jsonl"):
 # Tokenize & mask labels for causal LM
 # ---------------------
 def tokenize_and_mask(tokenizer, question, rationale, answer, prompt_template="Q: {q}\nA: "):
+    # Build prompt and target strings
     prompt_text = prompt_template.format(q=question)
-    target_text = (rationale.strip() + ("\n" if not rationale.endswith("\n") else "")) + f"{answer.strip()}"
+    target_text = (rationale.strip() + "\nFinal answer: " + answer.strip()) if rationale and rationale.strip() else ("Final answer: " + answer.strip())
+
+    # encode without adding special tokens automatically (we control layout)
     prompt_ids = tokenizer(prompt_text, add_special_tokens=False)["input_ids"]
     target_ids = tokenizer(target_text, add_special_tokens=False)["input_ids"]
+
     input_ids = prompt_ids + target_ids
     attention_mask = [1] * len(input_ids)
     labels = [-100] * len(prompt_ids) + target_ids
     return input_ids, attention_mask, labels
 
 # ---------------------
-# Dataset and collator
+# PyTorch Dataset and collator
 # ---------------------
 class JsonlCausalDataset(Dataset):
     def __init__(self, path, tokenizer, max_examples=None, prompt_template="Q: {q}\nA: "):
@@ -113,91 +123,89 @@ class JsonlCausalDataset(Dataset):
         self.tokenizer = tokenizer
         self.prompt_template = prompt_template
 
-    def __len__(self): return len(self.rows)
+    def __len__(self):
+        return len(self.rows)
 
     def __getitem__(self, idx):
         ex = self.rows[idx]
-        input_ids, attn, labels = tokenize_and_mask(
-            self.tokenizer,
-            ex.get("question",""),
-            ex.get("rationale",""),
-            ex.get("answer",""),
-            self.prompt_template
-        )
-        return {
-            "input_ids": torch.tensor(input_ids, dtype=torch.long),
-            "attention_mask": torch.tensor(attn, dtype=torch.long),
-            "labels": torch.tensor(labels, dtype=torch.long)
-        }
+        input_ids, attn, labels = tokenize_and_mask(self.tokenizer, ex["question"], ex.get("rationale",""), ex.get("answer",""), self.prompt_template)
+        return {"input_ids": torch.tensor(input_ids, dtype=torch.long),
+                "attention_mask": torch.tensor(attn, dtype=torch.long),
+                "labels": torch.tensor(labels, dtype=torch.long)}
 
-def collate_causal(batch, pad_token_id, max_seq_len=512):
-    seqs = [ex["input_ids"] for ex in batch]
-    max_len = min(max(len(s) for s in seqs), max_seq_len)
-    input_ids, attention_mask, labels = [], [], []
+def collate_causal(batch, pad_token_id):
+    max_len = max(x["input_ids"].size(0) for x in batch)
+    input_ids = []
+    attention_mask = []
+    labels = []
     for ex in batch:
-        ids = ex["input_ids"][:max_len]
-        attn = ex["attention_mask"][:max_len]
-        lbls = ex["labels"][:max_len]
-        pad = max_len - ids.size(0)
-        if pad > 0:
-            ids = torch.cat([ids, torch.full((pad,), pad_token_id, dtype=torch.long)])
-            attn = torch.cat([attn, torch.zeros((pad,), dtype=torch.long)])
-            lbls = torch.cat([lbls, torch.full((pad,), -100, dtype=torch.long)])
-        input_ids.append(ids); attention_mask.append(attn); labels.append(lbls)
-    return {
-        "input_ids": torch.stack(input_ids),
-        "attention_mask": torch.stack(attention_mask),
-        "labels": torch.stack(labels)
-    }
+        pad = max_len - ex["input_ids"].size(0)
+        input_ids.append(torch.cat([ex["input_ids"], torch.full((pad,), pad_token_id, dtype=torch.long)]))
+        attention_mask.append(torch.cat([ex["attention_mask"], torch.zeros((pad,), dtype=torch.long)]))
+        labels.append(torch.cat([ex["labels"], torch.full((pad,), -100, dtype=torch.long)]))
+    return {"input_ids": torch.stack(input_ids),
+            "attention_mask": torch.stack(attention_mask),
+            "labels": torch.stack(labels)}
 
 # ---------------------
 # evaluation()
 # ---------------------
 def evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run):
+    """
+    Evaluate the model on eval_dataloader.
+    Returns (eval_ppl, eval_epoch_loss, val_step_loss_list, val_step_perplexity_list)
+    """
     model.eval()
-    val_step_loss, val_step_perplexity = [], []
+    val_step_loss = []
+    val_step_perplexity = []
     eval_loss = 0.0
+
     device = next(model.parameters()).device
     with MemoryTrace() as memtrace:
         with torch.no_grad():
             for step, batch in enumerate(tqdm(eval_dataloader, colour="green", desc="evaluating Epoch", dynamic_ncols=True)):
+                # move to device
                 for k in batch.keys():
-                    batch[k] = batch[k].to(device, non_blocking=True)
+                    batch[k] = batch[k].to(device)
                 outputs = model(**batch)
                 loss = outputs.loss
-                loss_item = float(loss.detach().float().mean().item())
                 if train_config.save_metrics:
-                    val_step_loss.append(loss_item)
-                    try:
-                        val_step_perplexity.append(math.exp(loss_item))
-                    except Exception:
-                        val_step_perplexity.append(float("nan"))
-                eval_loss += loss_item
+                    val_step_loss.append(loss.detach().float().item())
+                    val_step_perplexity.append(float(torch.exp(loss.detach().float())))
+                eval_loss += loss.detach().float()
     eval_epoch_loss = eval_loss / max(1, len(eval_dataloader))
-    try:
-        eval_ppl = math.exp(eval_epoch_loss)
-    except Exception:
-        eval_ppl = float("nan")
+    eval_ppl = float(torch.exp(eval_epoch_loss))
     if wandb_run:
         wandb_run.log({'eval/perplexity': eval_ppl, 'eval/loss': float(eval_epoch_loss)}, commit=False)
-    return float(eval_ppl), float(eval_epoch_loss), val_step_loss, val_step_perplexity
+    return eval_ppl, float(eval_epoch_loss), val_step_loss, val_step_perplexity
 
 # ---------------------
-# train()
+# train() - robust loop with AMP and exception handling
 # ---------------------
 def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_scheduler, gradient_accumulation_steps, train_config, wandb_run=None):
+    """
+    Train loop adapted from your provided code but with robust error handling and AMP/GradScaler usage.
+    """
     local_rank = None
-    use_fp16 = getattr(train_config, "use_fp16", False)
-    use_bf16 = getattr(train_config, "use_bf16", True)  # default to bf16 on A100
-    scaler = GradScaler(enabled=use_fp16)  # GradScaler not needed for bf16
+    rank = None
+    use_fp16 = getattr(train_config, "mixed_precision", False)
+    scaler = GradScaler(enabled=use_fp16)
 
-    train_prep, train_loss, val_prep, val_loss = [], [], [], []
+    # metric lists
+    train_prep = []
+    train_loss = []
+    val_prep = []
+    val_loss = []
+
     if train_config.save_metrics:
         metrics_filename = f"{train_config.output_dir}/metrics_data_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.json"
-        train_step_perplexity, train_step_loss = [], []
-        val_step_loss, val_step_perplexity = [], []
+        train_step_perplexity = []
+        train_step_loss = []
+        val_step_loss = []
+        val_step_perplexity = []
 
     epoch_times = []
+    checkpoint_times = []
     results = {}
     best_val_loss = float("inf")
     total_train_steps = 0
@@ -205,12 +213,9 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
 
     device = next(model.parameters()).device
 
-    # Disable cache for training (esp. with grad checkpointing)
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
-
     for epoch in range(train_config.num_epochs):
-        if max_steps_reached: break
+        if max_steps_reached:
+            break
         epoch_start_time = time.perf_counter()
         with MemoryTrace() as memtrace:
             model.train()
@@ -220,25 +225,24 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
                 optimizer.zero_grad()
                 for step, batch in enumerate(train_dataloader):
                     total_train_steps += 1
+                    # optional max-train-step control
                     if getattr(train_config, "max_train_step", 0) > 0 and total_train_steps > train_config.max_train_step:
                         max_steps_reached = True
                         print("max training steps reached, stopping training")
                         break
 
+                    # move to device
                     for key in batch.keys():
-                        batch[key] = batch[key].to(device, non_blocking=True)
+                        batch[key] = batch[key].to(device)
 
-                    # Mixed precision forward with torch.autocast (supports device_type)
+                    # Forward (with try/except so a single bad batch won't crash everything)
                     try:
-                        if use_bf16:
-                            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                                outputs = model(**batch)
-                                loss_raw = outputs.loss
-                        else:
-                            with torch.autocast(device_type="cuda", dtype=torch.float16, enabled=use_fp16):
-                                outputs = model(**batch)
-                                loss_raw = outputs.loss
+                        # with autocast(device_type="cuda", enabled=use_fp16):
+                        with autocast(enabled=use_fp16):
+                            outputs = model(**batch)
+                            loss_raw = outputs.loss
                     except Exception as e:
+                        # log and save bad batch for inspection, then skip
                         print(f"[WARN] Exception during forward at step {step}: {e}", flush=True)
                         try:
                             bad_path = os.path.join(train_config.output_dir, f"bad_batch_step{step}.pt")
@@ -249,42 +253,46 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
                         optimizer.zero_grad()
                         continue
 
+                    # scale by grad accumulation
                     loss = loss_raw / gradient_accumulation_steps
 
+                    # detect NaN / Inf
                     if torch.isnan(loss) or torch.isinf(loss):
                         print(f"[WARN] loss is NaN or Inf at step {step}, skipping batch", flush=True)
                         optimizer.zero_grad()
                         continue
 
-                    # Log step metrics as floats
-                    loss_item = float(loss.detach().float().mean().item())
+                    # logging metrics
                     if train_config.save_metrics:
-                        train_step_loss.append(loss_item)
+                        train_step_loss.append(loss.detach().float().item())
+                        # perplexity uses exp(loss) on the un-accumulated loss approx
                         try:
-                            train_step_perplexity.append(math.exp(loss_item))
+                            train_step_perplexity.append(float(torch.exp(loss.detach().float())))
                         except Exception:
                             train_step_perplexity.append(float("nan"))
 
-                    # Accumulate epoch loss as float
-                    total_loss += float(loss_raw.detach().float().mean().item())
+                    total_loss += loss_raw.detach().float()
 
-                    # Backward
-                    if use_fp16 and not use_bf16:
+                    # Backward (with scaler if fp16)
+                    if use_fp16:
                         scaler.scale(loss).backward()
                     else:
                         loss.backward()
 
-                    # Optimizer step on accumulation boundary
+                    # Step if accumulation condition met
                     if (step + 1) % gradient_accumulation_steps == 0 or step == len(train_dataloader) - 1:
-                        if use_fp16 and not use_bf16:
+                        # unscale before clipping if fp16
+                        if use_fp16:
                             try:
                                 scaler.unscale_(optimizer)
                             except Exception as e:
                                 print(f"[WARN] scaler.unscale_() failed: {e}", flush=True)
+                        # gradient clipping
                         if train_config.gradient_clipping and train_config.gradient_clipping_threshold > 0.0:
                             torch.nn.utils.clip_grad_norm_(model.parameters(), train_config.gradient_clipping_threshold)
 
-                        if use_fp16 and not use_bf16:
+                        # optimizer step
+                        if use_fp16:
                             try:
                                 scaler.step(optimizer)
                                 scaler.update()
@@ -298,16 +306,25 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
                         optimizer.zero_grad()
                         pbar.update(1)
 
+                    # optional profiling / logging
                     if train_config.use_profiler or train_config.flop_counter:
                         profile_context.step()
 
-                    # Optional logging hook
+                    if wandb_run:
+                        wandb_run.log({
+                            'train/epoch': epoch + 1,
+                            'train/step': epoch * len(train_dataloader) + step,
+                            'train/loss': loss.detach().float(),
+                        })
+
+                    # update tqdm
                     try:
-                        pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs} step {step}/{len(train_dataloader)} (loss: {loss_item:.4f})")
+                        cur_loss = float(loss.detach().float())
+                        pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs} step {step}/{len(train_dataloader)} (loss: {cur_loss:.4f})")
                     except Exception:
                         pbar.set_description(f"Training Epoch: {epoch+1}/{train_config.num_epochs} step {step}/{len(train_dataloader)}")
 
-                    # Periodic validation
+                    # periodic validation
                     if step % 50 == 0 and train_config.run_validation and eval_dataloader is not None:
                         eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
                         if train_config.save_metrics:
@@ -315,22 +332,20 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
                             val_step_perplexity.extend(temp_step_perplexity)
                         model.train()
 
-                    # Persist metrics occasionally
+                    # save metrics occasionally
                     if train_config.save_metrics:
                         save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
 
                 pbar.close()
 
-        # Epoch metrics as floats
-        epoch_time = time.perf_counter() - epoch_start_time
-        train_epoch_loss = float(total_loss) / max(1, len(train_dataloader))
+        epoch_end_time = time.perf_counter() - epoch_start_time
+        epoch_times.append(epoch_end_time)
+        # compute epoch stats
+        train_epoch_loss = total_loss / max(1, len(train_dataloader))
         try:
-            train_perplexity = math.exp(train_epoch_loss)
+            train_perplexity = float(torch.exp(train_epoch_loss))
         except Exception:
             train_perplexity = float("nan")
-
-        # Update trackers
-        epoch_times.append(epoch_time)
         train_prep.append(float(train_perplexity))
         train_loss.append(float(train_epoch_loss))
         memtrace.print_stats()
@@ -339,18 +354,19 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
         except Exception:
             pass
 
-        # Validation and checkpoint
+        # run validation at epoch end
         if train_config.run_validation and eval_dataloader is not None:
             eval_ppl, eval_epoch_loss, temp_val_loss, temp_step_perplexity = evaluation(model, train_config, eval_dataloader, local_rank, tokenizer, wandb_run)
             if train_config.save_metrics:
                 val_step_loss.extend(temp_val_loss)
                 val_step_perplexity.extend(temp_step_perplexity)
 
+            # save checkpoint
             if train_config.save_model:
                 epoch_dir = os.path.join(train_config.output_dir, f"epoch{epoch+1}")
                 os.makedirs(epoch_dir, exist_ok=True)
+                # Save the model
                 model.save_pretrained(epoch_dir)
-                tokenizer.save_pretrained(epoch_dir)
                 print(f"Model saved in {epoch_dir}")
 
             if eval_epoch_loss < best_val_loss:
@@ -359,19 +375,22 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
             val_loss.append(float(best_val_loss))
             val_prep.append(float(eval_ppl))
 
-        print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_time:.1f}s")
+        print(f"Epoch {epoch+1}: train_perplexity={train_perplexity:.4f}, train_epoch_loss={train_epoch_loss:.4f}, epoch time {epoch_end_time:.1f}s")
 
+        # save metrics
         if train_config.save_metrics:
             save_to_json(metrics_filename, train_step_loss, train_loss, train_step_perplexity, train_prep, val_step_loss, val_loss, val_step_perplexity, val_prep)
 
-    # Aggregate summary
+    # aggregate results
     avg_epoch_time = sum(epoch_times) / max(1, len(epoch_times))
+    avg_checkpoint_time = sum(checkpoint_times) / max(1, len(checkpoint_times)) if checkpoint_times else 0
     results["avg_train_prep"] = sum(train_prep)/len(train_prep) if train_prep else 0.0
     results["avg_train_loss"] = sum(train_loss)/len(train_loss) if train_loss else 0.0
     if train_config.run_validation:
         results["avg_eval_prep"] = sum(val_prep)/len(val_prep) if val_prep else 0.0
         results["avg_eval_loss"] = sum(val_loss)/len(val_loss) if val_loss else 0.0
     results["avg_epoch_time"] = avg_epoch_time
+    results["avg_checkpoint_time"] = avg_checkpoint_time
     if train_config.save_metrics:
         results["metrics_filename"] = metrics_filename
     return results
@@ -381,70 +400,51 @@ def train(model, train_dataloader, eval_dataloader, tokenizer, optimizer, lr_sch
 # ---------------------
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="meta-llama/Llama-3.2-3B-Instruct")
-    ap.add_argument("--train_file", default="data/gsm8k_train_sft.jsonl")
-    ap.add_argument("--subset", type=int, default=500)
-    ap.add_argument("--out", default="checkpoints/vanilla_sft_direct")
+    ap.add_argument("--model", default="meta-llama/Llama-3.2-3B-Instruct", help="HF model id or local path")
+    ap.add_argument("--train_file", default="data/gsm8k_train_sft.jsonl", help="SFT training JSONL")
+    ap.add_argument("--subset", type=int, default=500, help="use first N examples (0 = full)")
+    ap.add_argument("--out", default="checkpoints/vanilla_sft_direct", help="output dir for checkpoints")
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--batch", type=int, default=1)
     ap.add_argument("--grad_accum", type=int, default=8)
     ap.add_argument("--lr", type=float, default=2e-5)
-    ap.add_argument("--max_seq_len", type=int, default=512)
+    ap.add_argument("--max_seq_len", type=int, default=256)
     ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--fp16", action="store_true")
-    ap.add_argument("--bf16", action="store_true", help="prefer bf16 mixed precision on A100")
-    ap.add_argument("--attn_impl", default="auto", choices=["auto","flash_attention_2","sdpa"])
+    ap.add_argument("--fp16", action="store_true", help="use fp16 mixed precision for training")
     args = ap.parse_args()
 
-    # Prepare data
+    # prepare data
     prepare_gsm8k_sft(args.train_file)
 
+    # load tokenizer + model
     print("[launcher] Loading tokenizer + model:", args.model)
-    tokenizer = AutoTokenizer.from_pretrained(args.model, use_fast=True)
+    tokenizer = AutoTokenizer.from_pretrained(args.model, use_auth_token=True)
     if getattr(tokenizer, "pad_token_id", None) is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # Attention implementation selection with safe fallback
-    attn_impl = None
-    if args.attn_impl == "flash_attention_2":
-        try:
-            import flash_attn  # noqa: F401
-            attn_impl = "flash_attention_2"
-        except Exception:
-            attn_impl = "sdpa"
-    elif args.attn_impl == "sdpa":
-        attn_impl = "sdpa"
-    else:
-        try:
-            import flash_attn  # noqa: F401
-            attn_impl = "flash_attention_2"
-        except Exception:
-            attn_impl = "sdpa"
-
-    # Load model; bf16 preferred on A100
-    prefer_bf16 = args.bf16 or (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8)
-    load_dtype = torch.bfloat16 if prefer_bf16 else torch.float32
+    # load model as float32 (we use autocast for mixed precision), this avoids some issues
+    dtype = torch.float32
     model = AutoModelForCausalLM.from_pretrained(
         args.model,
         device_map="auto",
-        dtype=load_dtype,
-        attn_implementation=attn_impl,
+        torch_dtype=dtype,
         low_cpu_mem_usage=True
     )
-    model.gradient_checkpointing_enable()
-    if hasattr(model.config, "use_cache"):
-        model.config.use_cache = False
 
+    # enable gradient checkpointing to reduce memory
+    model.gradient_checkpointing_enable()
     print("[launcher] Model loaded. sample param device:", next(model.parameters()).device)
 
-    # Build datasets and validation split
+    # build datasets
     subset = args.subset if args.subset > 0 else None
     ds = JsonlCausalDataset(args.train_file, tokenizer, max_examples=subset)
+    # small validation split: last 10% of ds
     n = len(ds)
-    n_val = max(1, int(0.1 * n)) if n > 1 else 0
+    n_val = max(1, int(0.1 * n)) if n>1 else 0
     if n_val:
         train_rows = ds.rows[:-n_val]
         val_rows = ds.rows[-n_val:]
+        # write temporary jsonls for simplicity
         tmp_train = os.path.join(args.out, "tmp_train.jsonl")
         tmp_val = os.path.join(args.out, "tmp_val.jsonl")
         os.makedirs(args.out, exist_ok=True)
@@ -458,36 +458,20 @@ def main():
         train_dataset = ds
         val_dataset = None
 
-    collator = lambda batch: collate_causal(batch, pad_token_id=tokenizer.pad_token_id, max_seq_len=args.max_seq_len)
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=args.batch,
-        shuffle=True,
-        collate_fn=collator,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True
-    )
-    eval_loader = DataLoader(
-        val_dataset,
-        batch_size=args.batch,
-        shuffle=False,
-        collate_fn=collator,
-        num_workers=4,
-        pin_memory=True,
-        persistent_workers=True
-    ) if val_dataset else None
+    # dataloaders
+    collator = lambda batch: collate_causal(batch, pad_token_id=tokenizer.pad_token_id)
+    train_loader = DataLoader(train_dataset, batch_size=args.batch, shuffle=True, collate_fn=collator, num_workers=2)
+    eval_loader = DataLoader(val_dataset, batch_size=args.batch, shuffle=False, collate_fn=collator, num_workers=2) if val_dataset else None
 
     print(f"[launcher] train size={len(train_dataset)}, val size={len(val_dataset) if val_dataset else 0}")
 
-    # Optimizer & scheduler
-    try:
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0, fused=True)
-    except TypeError:
-        optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
+    # optimizer & scheduler
+    optimizer = optim.AdamW(model.parameters(), lr=args.lr, weight_decay=0.0)
     scheduler = StepLR(optimizer, step_size=1, gamma=0.85)
 
-    class Cfg: pass
+    # train_config simple object to pass to train()
+    class Cfg:
+        pass
     cfg = Cfg()
     cfg.num_epochs = args.epochs
     cfg.gradient_accumulation_steps = args.grad_accum
@@ -503,22 +487,23 @@ def main():
     cfg.flop_counter = False
     cfg.batching_strategy = "padding"
     cfg.context_length = args.max_seq_len
-    cfg.num_workers_dataloader = 4
+    cfg.num_workers_dataloader = 2
     cfg.per_device_train_batch_size = args.batch
     cfg.lr = args.lr
     cfg.seed = args.seed
-    cfg.use_fp16 = args.fp16 and not prefer_bf16
-    cfg.use_bf16 = prefer_bf16
+    cfg.mixed_precision = args.fp16
 
+    # seed
     torch.manual_seed(cfg.seed)
     random.seed(cfg.seed)
 
+    # call train()
     print("[launcher] Starting training. Output dir:", cfg.output_dir)
     os.makedirs(cfg.output_dir, exist_ok=True)
     results = train(model, train_loader, eval_loader, tokenizer, optimizer, scheduler, cfg.gradient_accumulation_steps, cfg, None)
 
     print("[launcher] Training finished. Summary results:")
-    for k, v in results.items():
+    for k,v in results.items():
         print(f"  {k}: {v}")
     print("Done.")
 
