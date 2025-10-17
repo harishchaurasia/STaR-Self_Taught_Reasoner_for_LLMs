@@ -20,7 +20,7 @@ def main():
     args = ap.parse_args()
 
     tok = AutoTokenizer.from_pretrained(args.model, use_auth_token=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model, torch_dtype="auto", device_map="auto", use_auth_token=True)
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype="auto", device_map="auto", use_auth_token=True)
 
     missed_ids = {r["id"] for r in read_jsonl(args.missed)}
     pool = [r for r in read_jsonl(args.train) if r["id"] not in missed_ids]

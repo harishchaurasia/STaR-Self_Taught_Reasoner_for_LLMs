@@ -23,19 +23,19 @@ def main():
     ck = f"{args.workdir}/model_iter_{k}"
 
     # 1) forward (use base model for generation at iter 1; paper uses cur model but restarts training from base)
-    sh("python", "-m", "src.star_generate", "--model", args.base_model, "--train", args.train, "--out", fw)
+    sh("python3", "-m", "src.star_generate", "--model", args.base_model, "--train", args.train, "--out", fw)
 
     # 2) rationalize on missed
-    sh("python", "-m", "src.star_rationalize", "--model", args.base_model, "--train", args.train, "--missed", fw, "--out", rt)
+    sh("python3", "-m", "src.star_rationalize", "--model", args.base_model, "--train", args.train, "--missed", fw, "--out", rt)
 
     # 3) build SFT data
-    sh("python", "-m", "src.star_build", "--forward", fw, "--rationalized", rt, "--out", tr)
+    sh("python3", "-m", "src.star_build", "--forward", fw, "--rationalized", rt, "--out", tr)
 
     # 4) fine-tune FROM BASE
-    sh("python", "-m", "src.sft_train_wrapper", "--train", tr, "--save_dir", ck, "--base_model", args.base_model)
+    sh("python3", "-m", "src.sft_train_wrapper", "--train", tr, "--save_dir", ck, "--base_model", args.base_model)
 
     # 5) evaluate
-    sh("python", "-m", "src.evaluate", "--model", ck, "--test", args.test, "--out", f"{args.workdir}/iter{k}_preds.jsonl")
+    sh("python3", "-m", "src.evaluate", "--model", ck, "--test", args.test, "--out", f"{args.workdir}/iter{k}_preds.jsonl")
 
 if __name__ == "__main__":
     main()
