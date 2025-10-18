@@ -15,11 +15,13 @@ def main():
     ap.add_argument("--max_new_tokens", type=int, default=256)
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--top_p", type=float, default=0.95)
-    ap.add_argument("--batch_size", type=int, default=16)  # NEW: batch size argument
+    ap.add_argument("--batch_size", type=int, default=16)
     args = ap.parse_args()
 
-    tok = AutoTokenizer.from_pretrained(args.model, use_auth_token=True)
-    model = AutoModelForCausalLM.from_pretrained(args.model, dtype="auto", device_map="auto", use_auth_token=True)
+    tok = AutoTokenizer.from_pretrained(args.model, token=True)
+    tok.pad_token = tok.eos_token
+    tok.padding_side = "left" 
+    model = AutoModelForCausalLM.from_pretrained(args.model, dtype="auto", device_map="auto", token=True)
 
     examples = list(read_jsonl(args.train))
     kept = []
