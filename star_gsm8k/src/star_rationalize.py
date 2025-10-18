@@ -92,25 +92,19 @@ def main():
 
     for i in tqdm(range(0, len(pool), B), desc="Rationalizing", ncols=80):
         batch = pool[i:i+B]
-        prompts = [RAT_TMPL.format(question=ex["question"], gold_final=ex["answer"]) for ex in batch]
-        inputs = tok(prompts, return_tensors="pt", padding=True).to(model.device)
+        # Inside the for i in range(...): loop, after you pick 'batch'
+        prompts = []
+        for ex in batch:
+            gold_num = extract_final(ex["answer"]) or ex["answer"]  # extract numeric gold if answer is a full text
+            prompts.append(RAT_TMPL.format(question=ex["question"], gold_final=gold_num))
 
-        # out_ids = model.generate(
-        #     **inputs,
-        #     max_new_tokens=args.max_new_tokens,
-        #     do_sample=False,
-        #     temperature=0.0,
-        #     top_p=1.0,
-        #     num_return_sequences=K,
-        #     pad_token_id=tok.eos_token_id,
-        # )
+        # prompts = [RAT_TMPL.format(question=ex["question"], gold_final=ex["answer"]) for ex in batch]
+        inputs = tok(prompts, return_tensors="pt", padding=True).to(model.device)
 
         out_ids = model.generate(
             **inputs,
             max_new_tokens=args.max_new_tokens,
             do_sample=False,              # deterministic
-            temperature=0.0,
-            top_p=1.0,
             num_beams=args.n_candidates,  # beams must be >= returns
             num_return_sequences=args.n_candidates,
             pad_token_id=tok.eos_token_id,

@@ -57,13 +57,23 @@ def normalize_answer(s: str):
         s = s[1:]
     return s
 
+# def exact_match_from_text(gold: str, text: str):
+#     pred = extract_final(text)
+#     if pred is None:
+#         pred = flexible_extract(text)
+#     p = normalize_answer(pred)
+#     g = normalize_answer(gold)
+#     return (p is not None) and (p == g)
+
+
 def exact_match_from_text(gold: str, text: str):
-    pred = extract_final(text)
-    if pred is None:
-        pred = flexible_extract(text)
+    # Try to parse the gold as GSM8K-style; if not, fall back to raw
+    gold_num = extract_final(gold) or gold
+    pred = extract_final(text) or flexible_extract(text)
     p = normalize_answer(pred)
-    g = normalize_answer(gold)
+    g = normalize_answer(gold_num)
     return (p is not None) and (p == g)
+
 
 def read_jsonl(path):
     with open(path, "r", encoding="utf-8") as f:
