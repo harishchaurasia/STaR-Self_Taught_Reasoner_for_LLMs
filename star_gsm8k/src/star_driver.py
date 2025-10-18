@@ -13,6 +13,8 @@ def main():
     ap.add_argument("--base_model", required=True)
     ap.add_argument("--workdir", default="run/star")
     ap.add_argument("--iter", type=int, default=1)
+    ap.add_argument("--batch_size", type=int, default=16)
+
     args = ap.parse_args()
 
     os.makedirs(args.workdir, exist_ok=True)
@@ -23,10 +25,12 @@ def main():
     ck = f"{args.workdir}/model_iter_{k}"
 
     # 1) forward (use base model for generation at iter 1; paper uses cur model but restarts training from base)
-    sh("python3", "-m", "src.star_generate", "--model", args.base_model, "--train", args.train, "--out", fw)
+    sh("python3", "-m", "src.star_generate", "--model", args.base_model, "--train", args.train, "--out", fw, "--batch_size", str(args.batch_size))
+
 
     # 2) rationalize on missed
-    sh("python3", "-m", "src.star_rationalize", "--model", args.base_model, "--train", args.train, "--missed", fw, "--out", rt)
+    # sh("python3", "-m", "src.star_rationalize", "--model", args.base_model, "--train", args.train, "--missed", fw, "--out", rt)
+    sh("python3", "-m", "src.star_rationalize", "--model", args.base_model, "--train", args.train, "--missed", fw, "--out", rt, "--batch_size", str(args.batch_size))
 
     # 3) build SFT data
     sh("python3", "-m", "src.star_build", "--forward", fw, "--rationalized", rt, "--out", tr)
