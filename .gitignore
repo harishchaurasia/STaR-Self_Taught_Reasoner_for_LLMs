@@ -3,3 +3,9 @@ star_gsm8k/.venv
 star_gsm8k/hf_models
 # ignore large model checkpoints
 star_gsm8k/run/star/model_iter_2/epoch1/*.safetensors
+
+# ignore virtualenv and compiled python files
+star_gsm8k/star_env/
+**/*.pyc
+__pycache__/
+*.py[cod]
