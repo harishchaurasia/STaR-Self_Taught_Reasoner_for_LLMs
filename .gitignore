@@ -21,3 +21,6 @@ star_gsm8k/star_env/
 **/*.pyc
 __pycache__/
 *.py[cod]
+
+# prevent committing large model checkpoints
+star_gsm8k/hf_models/
