@@ -1,3 +1,5 @@
 /Users/harishchaurasia/Desktop/StaR Model Training and Inferencing/star_gsm8k/.venv
 star_gsm8k/.venv
 star_gsm8k/hf_models
+# ignore large model checkpoints
+star_gsm8k/run/star/model_iter_2/epoch1/*.safetensors
