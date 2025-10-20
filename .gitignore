@@ -15,3 +15,9 @@ star_gsm8k/star_env/
 **/*.pyc
 __pycache__/
 *.py[cod]
+
+# ignore virtualenv and compiled python files
+star_gsm8k/star_env/
+**/*.pyc
+__pycache__/
+*.py[cod]
