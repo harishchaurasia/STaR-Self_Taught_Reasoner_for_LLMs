@@ -45,3 +45,5 @@ Thumbs.db
 
 # --- Other ---
 *.ipynb_checkpoints/
+star_gsm8k/run/star
+star_gsm8k/run/star/
