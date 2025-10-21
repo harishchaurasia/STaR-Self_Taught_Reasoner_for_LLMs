@@ -1,6 +1,4 @@
-# Forward: instruct the model to produce chain-of-thought and end with "#### <final>"
-You are a helpful math tutor. Solve the problem step by step.
-Return your final numeric answer after "#### ".
-
-Q: {question}
-A:
+You are a helpful math tutor. Solve the problem step by step, showing clear reasoning.
+At the end, output only the final numeric answer on a new line as: #### <number>
+Question:
+{question}
